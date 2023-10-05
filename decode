@@ -1,0 +1,109 @@
+#!/usr/bin/env python
+import optparse
+import sys
+import models
+from collections import namedtuple
+import math
+from functools import reduce
+
+
+def bitmap(sequence):
+  """ Generate a coverage bitmap for a sequence of indexes """
+  return reduce(lambda x,y: x|y, map(lambda i: int('1'+'0'*i,2), sequence), 0)
+
+
+def bitmap2str(b, n, on='o', off='.'):
+  """ Generate a length-n string representation of bitmap b """
+  return '' if n==0 else (on if b&1==1 else off) + bitmap2str(b>>1, n-1, on, off)
+
+
+optparser = optparse.OptionParser()
+optparser.add_option("-i", "--input", dest="input", default="data/input", help="File containing sentences to translate (default=data/input)")
+optparser.add_option("-t", "--translation-model", dest="tm", default="data/tm", help="File containing translation model (default=data/tm)")
+optparser.add_option("-l", "--language-model", dest="lm", default="data/lm", help="File containing ARPA-format language model (default=data/lm)")
+optparser.add_option("-n", "--num_sentences", dest="num_sents", default=sys.maxsize, type="int", help="Number of sentences to decode (default=no limit)")
+optparser.add_option("-k", "--translations-per-phrase", dest="k", default=1, type="int", help="Limit on number of translations to consider per phrase (default=1)")
+optparser.add_option("-s", "--stack-size", dest="s", default=1, type="int", help="Maximum stack size (default=1)")
+optparser.add_option("-v", "--verbose", dest="verbose", action="store_true", default=False,  help="Verbose mode (default=off)")
+optparser.add_option("-r", "--reordering-limit", dest="rl", default=sys.maxsize, type=int, help="Reordering limit (default=no limit")
+opts = optparser.parse_args()[0]
+
+
+tm = models.TM(opts.tm, opts.k)
+lm = models.LM(opts.lm)
+french = [tuple(line.strip().split()) for line in open(opts.input).readlines()[:opts.num_sents]]
+reorder_limit = opts.rl
+alpha = 1.3
+
+# tm should translate unknown words as-is with probability 1
+for word in set(sum(french,())):
+  if (word,) not in tm:
+    tm[(word,)] = [models.phrase(word, 0.0)]
+
+sys.stderr.write("Decoding %s...\n" % (opts.input,))
+for f in french:
+  # The following code implements a monotone decoding
+  # algorithm (one that doesn't permute the target phrases).
+  # Hence all hypotheses in stacks[i] represent translations of 
+  # the first i words of the input sentence. You should generalize
+  # this so that they can represent translations of *any* i words.
+  hypothesis = namedtuple("hypothesis", "logprob, lm_state, predecessor, phrase, used_pos, prev_end_pos")
+  # used_pos: an integer bitmap indicating the position that is being used
+  # prev_end_pos: an integer representing the end position of last added phrase
+  initial_hypothesis = hypothesis(0.0, lm.begin(), None, None, 0, -1)
+  stacks = [{} for _ in f] + [{}]
+  stacks[0][(lm.begin(), 0, -1)] = initial_hypothesis
+  # stack l stores the hypotheses with l words translated
+  for l, stack in enumerate(stacks[:-1]):
+    best = max(stack.values(),key=lambda h: -h.logprob)
+    pruned = sorted(filter(lambda h: h.logprob >= alpha*best.logprob, stack.values()), key=lambda h: -h.logprob)[:opts.s] # histogram + threshold pruning
+    # pruned = sorted(stack.values(),key=lambda h: -h.logprob)[:opts.s]
+    for h in pruned:
+      for i in range(len(f)):
+        # reordering limit
+        if abs(i - h.prev_end_pos-1) > reorder_limit:
+          continue
+
+        for j in range(i+1,len(f)+1):
+          if h.used_pos & bitmap(range(i, j)):
+            # if for some j there's overlap, for all following j there's overlap as well
+            break
+          if f[i:j] in tm:
+            # intersection of h.used_pos and interval range(i,j) is empty
+            new_used_pos = h.used_pos | bitmap(range(i, j)) # mark range(i,j) as used
+            len_p = j-i # length of phrase
+
+            # get new (combined) hypothesis
+            for phrase in tm[f[i:j]]:
+              logprob = h.logprob + phrase.logprob
+              lm_state = h.lm_state
+              for word in phrase.english.split():
+                (lm_state, word_logprob) = lm.score(lm_state, word)
+                logprob += word_logprob
+              logprob += lm.end(lm_state) if j == len(f) else 0.0
+              new_hypothesis = hypothesis(logprob, lm_state, h, phrase, new_used_pos, j)
+
+              # recombination:
+              new_len = l+len_p
+              recomb_key = (lm_state, new_used_pos, j)
+              if recomb_key not in stacks[new_len] or stacks[new_len][recomb_key].logprob < logprob:
+                stacks[new_len][recomb_key] = new_hypothesis 
+  winner = max(stacks[-1].values(), key=lambda h: h.logprob)
+  def extract_english(h): 
+    # return "" if h.predecessor is None else "%s%s " % (extract_english(h.predecessor), h.phrase.english)
+    results = []
+    while h.predecessor is not None:
+      results.append((h.phrase.english, h.prev_end_pos))
+      h = h.predecessor
+    results = sorted(results, key=lambda x:x[1])
+    words = list(zip(*results))[0]
+    return ' '.join(words)
+
+  print(extract_english(winner))
+
+  if opts.verbose:
+    def extract_tm_logprob(h):
+      return 0.0 if h.predecessor is None else h.phrase.logprob + extract_tm_logprob(h.predecessor)
+    tm_logprob = extract_tm_logprob(winner)
+    sys.stderr.write("LM = %f, TM = %f, Total = %f\n" % 
+      (winner.logprob - tm_logprob, tm_logprob, winner.logprob))

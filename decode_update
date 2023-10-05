@@ -1,0 +1,211 @@
+#!/usr/bin/env python
+import optparse
+import sys
+import models
+import copy
+from collections import namedtuple
+
+optparser = optparse.OptionParser()
+optparser.add_option("-i", "--input", dest="input", default="data/input", help="File containing sentences to translate (default=data/input)")
+optparser.add_option("-t", "--translation-model", dest="tm", default="data/tm", help="File containing translation model (default=data/tm)")
+optparser.add_option("-l", "--language-model", dest="lm", default="data/lm", help="File containing ARPA-format language model (default=data/lm)")
+optparser.add_option("-n", "--num_sentences", dest="num_sents", default=sys.maxsize, type="int", help="Number of sentences to decode (default=no limit)")
+optparser.add_option("-k", "--translations-per-phrase", dest="k", default=5, type="int", help="Limit on number of translations to consider per phrase (default=1)")
+optparser.add_option("-s", "--stack-size", dest="s", default=10000, type="int", help="Maximum stack size (default=1)")
+optparser.add_option("-v", "--verbose", dest="verbose", action="store_true", default=False,  help="Verbose mode (default=off)")
+opts = optparser.parse_args()[0]
+
+tm = models.TM(opts.tm, opts.k)
+lm = models.LM(opts.lm)
+french = [tuple(line.strip().split()) for line in open(opts.input).readlines()[:opts.num_sents]]
+
+# tm should translate unknown words as-is with probability 1
+for word in set(sum(french,())):
+  if (word,) not in tm:
+    tm[(word,)] = [models.phrase(word, 0.0)]
+
+sys.stderr.write("Decoding %s...\n" % (opts.input,))
+for f in french:
+  # The following code implements a monotone decoding
+  # algorithm (one that doesn't permute the target phrases).
+  # Hence all hypotheses in stacks[i] represent translations of 
+  # the first i words of the input sentence. You should generalize
+  # this so that they can represent translations of *any* i words.
+  hypothesis = namedtuple("hypothesis", "logprob, lm_state, predecessor, phrase, f, prev_end_pos")
+  initial_hypothesis = hypothesis(0.0, lm.begin(), None, None, 0, -1)
+  stacks = [{} for _ in f] + [{}]
+  stacks[0][lm.begin()] = initial_hypothesis
+  for i, stack in enumerate(stacks[:-1]):
+    for h in sorted(stack.values(),key=lambda h: -h.logprob)[:opts.s]: # prune
+      for j in range(i+1,len(f)+1):
+        if f[i:j] in tm:
+          for phrase in tm[f[i:j]]:
+            logprob = h.logprob + phrase.logprob
+            lm_state = h.lm_state
+            for word in phrase.english.split():
+              (lm_state, word_logprob) = lm.score(lm_state, word)
+              logprob += word_logprob
+            logprob += lm.end(lm_state) if j == len(f) else 0.0
+            new_hypothesis = hypothesis(logprob, lm_state, h, phrase, f[i:j],  j)
+            if lm_state not in stacks[j] or stacks[j][lm_state].logprob < logprob: # second case is recombination
+              stacks[j][lm_state] = new_hypothesis 
+  winner = max(stacks[-1].values(), key=lambda h: h.logprob)
+
+
+  def extract_pair(h): 
+    # returns 1. the translated result sentence, 2. result(english phrase, prev_end_pos, logprob), 3. french ((french phrase, prev_end_pos))
+    results = []
+    french = []
+    while h.predecessor is not None:
+      results.append((h.phrase.english, h.prev_end_pos, h.phrase.logprob))
+      french.append((h.f, h.prev_end_pos))
+      h = h.predecessor
+    results = sorted(results, key=lambda x:x[1])
+    french = sorted(french, key=lambda x:x[1])
+    words = list(zip(*results))[0]
+    return ' '.join(words), results, french
+
+  #print(extract_english(winner))
+
+  if opts.verbose:
+    def extract_tm_logprob(h):
+      return 0.0 if h.predecessor is None else h.phrase.logprob + extract_tm_logprob(h.predecessor)
+    tm_logprob = extract_tm_logprob(winner)
+    sys.stderr.write("LM = %f, TM = %f, Total = %f\n" % 
+      (winner.logprob - tm_logprob, tm_logprob, winner.logprob))
+
+  def translate_length(english):
+    length = 0
+    for i in range(len(english)):
+      length += len(english[i])
+    return length
+  
+  def greedy_score(lm, english, french):
+    logprob = 0
+    lm_state = lm.begin()
+    for i in range(len(french)):
+        logprob += english[i][2] # add translation model probability
+        for word in english[i][0].split():
+            (lm_state, word_logprob) = lm.score(lm_state, word)
+            logprob += word_logprob # add language model probability
+        logprob += lm.end(lm_state) if i == len(french) - 1 else 0 # not sure correct
+        logprob -= translate_length(english)
+    #print(logprob)
+    return logprob
+
+  def neighborhood(english, french, tm):
+      return swap(english, french) + replace(english, french, tm) + bireplace(english, french, tm) + split(english, french, tm) + merge(english, french, tm)
+
+  def swap_phrase(phrase, i, j):
+      swapped_phrase = copy.deepcopy(phrase)
+      tmp = swapped_phrase[i]
+      swapped_phrase[i] = swapped_phrase[j]
+      swapped_phrase[j] = tmp
+      return swapped_phrase
+
+  def swap(english, french):
+    results = []
+    for i in range(len(french) - 1):
+      for j in range(i, len(french)):
+        swapped_english = swap_phrase(english, i, j)
+        swapped_french = swap_phrase(french, i, j)
+        results.append((swapped_english, swapped_french))
+    return results
+
+  '''
+  def swap(english, french):
+    results = []
+    for i in range(len(french) - 1):
+      swapped_english = swap_phrase(english, i, i+1)
+      swapped_french = swap_phrase(french, i, i+1)
+      results.append((swapped_english, swapped_french))
+    return results
+  '''
+
+  def replace(english, french, tm):
+    results = []
+    for i in range(len(french)):
+      if french[i] not in tm: continue
+      alternatives = tm[french[i]]
+      for phrase in alternatives:
+        replaced_english = copy.deepcopy(english)
+        replaced_english[i] = phrase
+        results.append((replaced_english, french))
+    return results
+
+  def bireplace(english, french, tm):
+    results = []
+    for i in range(len(french)-1):
+      if french[i] not in tm or french[i+1] not in tm: continue
+      for phrase1 in tm[french[i]]:
+        for phrase2 in tm[french[i+1]]:
+          replaced_english = copy.deepcopy(english)
+          replaced_english[i] = phrase1
+          replaced_english[i+1] = phrase2
+          results.append((replaced_english, french))
+    return results
+
+  def split_phrase(phrase, i, first, second):
+    split_phrase = copy.deepcopy(phrase)
+    split_phrase.insert(i, first)
+    split_phrase[i+1] = second
+    return split_phrase
+
+  def split(english, french, tm):
+    # allow our decoder to split in two parts a given source phrase
+    results = []
+    for i in range(len(french)):
+      if len(french[i]) > 1:
+        for j in range(len(french[i])):
+          first_half = french[i][:j+1]
+          second_half = french[i][j+1:]
+          if first_half not in tm or second_half not in tm: continue
+          for phrase1 in tm[first_half]:
+            for phrase2 in tm[second_half]:
+              split_french = split_phrase(french, i, first_half, second_half)
+              split_english = split_phrase(english, i, phrase1, phrase2)
+              results.append((split_english, split_french))
+    return results
+
+  def merge(english, french, tm):
+    results = []
+    for i in range(len(french)-1):
+      french_1 = french[i]
+      french_2 = french[i+1]
+      english_1 = english[i]
+      english_2 = english[i+1]
+      if (french_1+french_2) in tm:
+        merge_french = copy.deepcopy(french)
+        merge_french[i+1:] = french[i+2:]
+        merge_french[i] = french_1+french_2
+        merge_english = copy.deepcopy(english)
+        merge_english[i+1:] = english[i+2:]
+        merge_english[i] = english_1+english_2
+        results.append((merge_english, merge_french))
+    return results
+
+  def greedy_decoder(seed, lm, tm): #seed should be winner
+    _, english, french = extract_pair(seed)
+    current = (english, french)
+    for i in range(200):
+      current_score = greedy_score(lm, current[0], current[1])
+      s = current_score
+      best_h = current
+      #print(best_h)
+      for h in neighborhood(english, french, tm):
+        c = greedy_score(lm, h[0], h[1])
+        #print(best_h)
+        #print(c)
+        #print(current_score)
+        #if score of new hypothesis is greater, replace best hypothesis
+        if c > current_score: 
+          s = c
+          best_h = h
+      if s == current_score:
+        return current
+      else:
+        current = best_h
+
+  results = greedy_decoder(winner, lm, tm)[0]
+  words = list(zip(*results))[0]
+  print(' '.join(words))
