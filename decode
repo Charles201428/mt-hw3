@@ -20,7 +20,7 @@ def bitmap2str(b, n, on='o', off='.'):
   """ Generate a length-n string representation of bitmap b """
   return '' if n==0 else (on if b&1==1 else off) + bitmap2str(b>>1, n-1, on, off)
 
-def create_new_hypothesis(h, phrase, lm, new_used_pos, j, f):
+def instanciate_hypothesis(h, phrase, lm, new_used_pos, j, f):
     logprob = h.logprob + phrase.logprob
     lm_state = h.lm_state
     for word in phrase.english.split():
@@ -29,25 +29,27 @@ def create_new_hypothesis(h, phrase, lm, new_used_pos, j, f):
     logprob += lm.end(lm_state) if j == len(f) else 0.0
     return hypothesis(logprob, lm_state, h, phrase, new_used_pos, j), logprob
 
-def recombination(stacks, new_len, recomb_key, new_hypothesis, logprob):
+def recomb(stacks, new_len, recomb_key, new_hypothesis, logprob):
     if recomb_key not in stacks[new_len] or stacks[new_len][recomb_key].logprob < logprob:
         stacks[new_len][recomb_key] = new_hypothesis
     return stacks
 
-def generate_hypothesis(h, i, j, f, tm, lm, stacks, l, alpha, reorder_limit, opts):
-    if abs(i - h.prev_end_pos - 1) > reorder_limit or h.used_pos & bitmap(range(i, j)):
+def generate_hypothesis(h, i, j, f, tm, lm, stacks, l, alpha, limit, opts):
+    if abs(i - h.prev_end_pos - 1) > limit or h.used_pos & bitmap(range(i, j)):
         return stacks
 
     if f[i:j] in tm:
         new_used_pos = h.used_pos | bitmap(range(i, j))
         len_p = j - i
         for phrase in tm[f[i:j]]:
-            new_hypothesis, logprob = create_new_hypothesis(h, phrase, lm, new_used_pos, j, f)
+            new_hypothesis, logprob = instanciate_hypothesis(h, phrase, lm, new_used_pos, j, f)
             new_len = l + len_p
             recomb_key = (new_hypothesis.lm_state, new_used_pos, j)
-            stacks = recombination(stacks, new_len, recomb_key, new_hypothesis, logprob)
+            stacks = recomb(stacks, new_len, recomb_key, new_hypothesis, logprob)
     return stacks
 
+def get_negative_logprob(h):
+    return -h.logprob
 
 
 optparser = optparse.OptionParser()
@@ -58,15 +60,15 @@ optparser.add_option("-n", "--num_sentences", dest="num_sents", default=sys.maxs
 optparser.add_option("-k", "--translations-per-phrase", dest="k", default=1, type="int", help="Limit on number of translations to consider per phrase (default=1)")
 optparser.add_option("-s", "--stack-size", dest="s", default=1, type="int", help="Maximum stack size (default=1)")
 optparser.add_option("-v", "--verbose", dest="verbose", action="store_true", default=False,  help="Verbose mode (default=off)")
-optparser.add_option("-r", "--reordering-limit", dest="rl", default=sys.maxsize, type=int, help="Reordering limit (default=no limit")
+optparser.add_option("-r", "--reordering-limit", dest="limit", default=sys.maxsize, type=int, help="Reordering limit (default=no limit")
 opts = optparser.parse_args()[0]
 
 
 tm = models.TM(opts.tm, opts.k)
 lm = models.LM(opts.lm)
 french = [tuple(line.strip().split()) for line in open(opts.input).readlines()[:opts.num_sents]]
-reorder_limit = opts.rl
-alpha = 1.3
+limit = opts.limit
+alpha = 1.5
 
 # tm should translate unknown words as-is with probability 1
 for word in set(sum(french,())):
@@ -88,7 +90,7 @@ for f in french:
   stacks[0][(lm.begin(), 0, -1)] = initial_hypothesis
   # stack l stores the hypotheses with l words translated
   for l, stack in enumerate(stacks[:-1]):
-    best = max(stack.values(), key=lambda h: -h.logprob)
+    best = max(stack.values(), key=get_negative_logprob)
     pruned = sorted(
         filter(lambda h: h.logprob >= alpha*best.logprob, stack.values()), 
         key=lambda h: -h.logprob
@@ -97,7 +99,7 @@ for f in french:
     for h in pruned:
         for i in range(len(f)):
             for j in range(i + 1, len(f) + 1):
-                stacks = generate_hypothesis(h, i, j, f, tm, lm, stacks, l, alpha, reorder_limit, opts)
+                stacks = generate_hypothesis(h, i, j, f, tm, lm, stacks, l, alpha, limit, opts)
 
 
   winner = max(stacks[-1].values(), key=lambda h: h.logprob)
