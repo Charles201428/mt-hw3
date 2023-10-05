@@ -3,9 +3,13 @@ import optparse
 import sys
 import models
 from collections import namedtuple
+
+
 import math
 from functools import reduce
 
+
+#these two functions are found in https://u.cs.biu.ac.il/~yogo/courses/mt2013/ass3/utils.py, bar-llan university
 
 def bitmap(sequence):
   """ Generate a coverage bitmap for a sequence of indexes """
@@ -15,6 +19,35 @@ def bitmap(sequence):
 def bitmap2str(b, n, on='o', off='.'):
   """ Generate a length-n string representation of bitmap b """
   return '' if n==0 else (on if b&1==1 else off) + bitmap2str(b>>1, n-1, on, off)
+
+def create_new_hypothesis(h, phrase, lm, new_used_pos, j, f):
+    logprob = h.logprob + phrase.logprob
+    lm_state = h.lm_state
+    for word in phrase.english.split():
+        (lm_state, word_logprob) = lm.score(lm_state, word)
+        logprob += word_logprob
+    logprob += lm.end(lm_state) if j == len(f) else 0.0
+    return hypothesis(logprob, lm_state, h, phrase, new_used_pos, j), logprob
+
+def recombination(stacks, new_len, recomb_key, new_hypothesis, logprob):
+    if recomb_key not in stacks[new_len] or stacks[new_len][recomb_key].logprob < logprob:
+        stacks[new_len][recomb_key] = new_hypothesis
+    return stacks
+
+def generate_hypothesis(h, i, j, f, tm, lm, stacks, l, alpha, reorder_limit, opts):
+    if abs(i - h.prev_end_pos - 1) > reorder_limit or h.used_pos & bitmap(range(i, j)):
+        return stacks
+
+    if f[i:j] in tm:
+        new_used_pos = h.used_pos | bitmap(range(i, j))
+        len_p = j - i
+        for phrase in tm[f[i:j]]:
+            new_hypothesis, logprob = create_new_hypothesis(h, phrase, lm, new_used_pos, j, f)
+            new_len = l + len_p
+            recomb_key = (new_hypothesis.lm_state, new_used_pos, j)
+            stacks = recombination(stacks, new_len, recomb_key, new_hypothesis, logprob)
+    return stacks
+
 
 
 optparser = optparse.OptionParser()
@@ -55,39 +88,18 @@ for f in french:
   stacks[0][(lm.begin(), 0, -1)] = initial_hypothesis
   # stack l stores the hypotheses with l words translated
   for l, stack in enumerate(stacks[:-1]):
-    best = max(stack.values(),key=lambda h: -h.logprob)
-    pruned = sorted(filter(lambda h: h.logprob >= alpha*best.logprob, stack.values()), key=lambda h: -h.logprob)[:opts.s] # histogram + threshold pruning
-    # pruned = sorted(stack.values(),key=lambda h: -h.logprob)[:opts.s]
+    best = max(stack.values(), key=lambda h: -h.logprob)
+    pruned = sorted(
+        filter(lambda h: h.logprob >= alpha*best.logprob, stack.values()), 
+        key=lambda h: -h.logprob
+    )[:opts.s]
+
     for h in pruned:
-      for i in range(len(f)):
-        # reordering limit
-        if abs(i - h.prev_end_pos-1) > reorder_limit:
-          continue
+        for i in range(len(f)):
+            for j in range(i + 1, len(f) + 1):
+                stacks = generate_hypothesis(h, i, j, f, tm, lm, stacks, l, alpha, reorder_limit, opts)
 
-        for j in range(i+1,len(f)+1):
-          if h.used_pos & bitmap(range(i, j)):
-            # if for some j there's overlap, for all following j there's overlap as well
-            break
-          if f[i:j] in tm:
-            # intersection of h.used_pos and interval range(i,j) is empty
-            new_used_pos = h.used_pos | bitmap(range(i, j)) # mark range(i,j) as used
-            len_p = j-i # length of phrase
 
-            # get new (combined) hypothesis
-            for phrase in tm[f[i:j]]:
-              logprob = h.logprob + phrase.logprob
-              lm_state = h.lm_state
-              for word in phrase.english.split():
-                (lm_state, word_logprob) = lm.score(lm_state, word)
-                logprob += word_logprob
-              logprob += lm.end(lm_state) if j == len(f) else 0.0
-              new_hypothesis = hypothesis(logprob, lm_state, h, phrase, new_used_pos, j)
-
-              # recombination:
-              new_len = l+len_p
-              recomb_key = (lm_state, new_used_pos, j)
-              if recomb_key not in stacks[new_len] or stacks[new_len][recomb_key].logprob < logprob:
-                stacks[new_len][recomb_key] = new_hypothesis 
   winner = max(stacks[-1].values(), key=lambda h: h.logprob)
   def extract_english(h): 
     # return "" if h.predecessor is None else "%s%s " % (extract_english(h.predecessor), h.phrase.english)
