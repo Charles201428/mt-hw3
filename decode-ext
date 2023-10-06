@@ -1,0 +1,219 @@
+#!/usr/bin/env python
+import optparse
+import sys
+import models
+import copy
+from collections import namedtuple
+
+optparser = optparse.OptionParser()
+optparser.add_option("-i", "--input", dest="input", default="data/input", help="File containing sentences to translate (default=data/input)")
+optparser.add_option("-t", "--translation-model", dest="tm", default="data/tm", help="File containing translation model (default=data/tm)")
+optparser.add_option("-l", "--language-model", dest="lm", default="data/lm", help="File containing ARPA-format language model (default=data/lm)")
+optparser.add_option("-n", "--num_sentences", dest="num_sents", default=sys.maxsize, type="int", help="Number of sentences to decode (default=no limit)")
+optparser.add_option("-k", "--translations-per-phrase", dest="k", default=5, type="int", help="Limit on number of translations to consider per phrase (default=1)")
+optparser.add_option("-s", "--stack-size", dest="s", default=10000, type="int", help="Maximum stack size (default=1)")
+optparser.add_option("-v", "--verbose", dest="verbose", action="store_true", default=False,  help="Verbose mode (default=off)")
+opts = optparser.parse_args()[0]
+
+tm = models.TM(opts.tm, opts.k)
+lm = models.LM(opts.lm)
+french = [tuple(line.strip().split()) for line in open(opts.input).readlines()[:opts.num_sents]]
+
+
+for word in set(sum(french,())):
+  if (word,) not in tm:
+    tm[(word,)] = [models.phrase(word, 0.0)]
+
+sys.stderr.write("Decoding %s...\n" % (opts.input,))
+Hypothesis = namedtuple("Hypothesis", ["logprob", "lm_state", "predecessor", "phrase", "f", "prev_end_pos"])
+
+def get_pruned_hypotheses(stack, limit):
+  return sorted(stack.values(), key=lambda h: -h.logprob)[:limit]
+
+def compute_new_hypothesis(phrase, current_hypothesis, f_segment, end_idx, lm, f):
+  lm_state = current_hypothesis.lm_state
+  logprob = current_hypothesis.logprob + phrase.logprob
+  for word in phrase.english.split():
+    (lm_state, word_logprob) = lm.score(lm_state, word)
+    logprob += word_logprob
+  logprob += lm.end(lm_state) if end_idx == len(f) else 0.0
+  return Hypothesis(logprob, lm_state, current_hypothesis, phrase, f_segment, end_idx)
+
+def translate_sentence(f, tm, lm, s):
+  stacks = [{} for _ in f] + [{}]
+  stacks[0][lm.begin()] = Hypothesis(0.0, lm.begin(), None, None, None, -1)
+  for idx, stack in enumerate(stacks[:-1]):
+    for current_hypothesis in get_pruned_hypotheses(stack, s):
+      for end_idx in range(idx + 1, len(f) + 1):
+        f_segment = f[idx:end_idx]
+        if f_segment in tm:
+          for phrase in tm[f_segment]:
+            new_hypothesis = compute_new_hypothesis(phrase, current_hypothesis, f_segment, end_idx, lm, f)
+            if new_hypothesis.lm_state not in stacks[end_idx] or stacks[end_idx][new_hypothesis.lm_state].logprob < new_hypothesis.logprob:
+              stacks[end_idx][new_hypothesis.lm_state] = new_hypothesis
+  return stacks
+
+for sentence in french:
+  stacks = translate_sentence(sentence, tm, lm, opts.s)
+  winner = max(stacks[-1].values(), key=lambda h: h.logprob)
+
+
+
+  def extract(h): 
+    results = []
+    french = []
+    while h.predecessor is not None:
+      results.append((h.phrase.english, h.prev_end_pos, h.phrase.logprob))
+      french.append((h.f, h.prev_end_pos))
+      h = h.predecessor
+    results = sorted(results, key=lambda x:x[1])
+    french = sorted(french, key=lambda x:x[1])
+    words = list(zip(*results))[0]
+    return ' '.join(words), results, french
+   
+  if opts.verbose:
+    def extract_tm_logprob(h):
+      return 0.0 if h.predecessor is None else h.phrase.logprob + extract_tm_logprob(h.predecessor)
+    tm_logprob = extract_tm_logprob(winner)
+    sys.stderr.write("LM = %f, TM = %f, Total = %f\n" % 
+      (winner.logprob - tm_logprob, tm_logprob, winner.logprob))
+
+  def calculate_translation_length(translated_text):
+      total_length = sum(len(item) for item in translated_text)
+      return total_length
+ 
+ 
+  def get_alternate_translations(english_phrases, french_phrases, translation_map):
+      alternate_pairs = []
+      
+      for idx, french_phrase in enumerate(french_phrases):
+          if french_phrase in translation_map:
+              for alt_translation in translation_map[french_phrase]:
+                  modified_english = english_phrases.copy()
+                  modified_english[idx] = alt_translation
+                  alternate_pairs.append((modified_english, french_phrases))
+                  
+      return alternate_pairs
+ 
+  def compute_greedy_score(language_model, translated_text, original_text):
+      probability_sum = 0
+      current_state = language_model.begin()
+      for idx in range(len(original_text)):
+          probability_sum += translated_text[idx][2]
+          for word_piece in translated_text[idx][0].split():
+              current_state, word_probability = language_model.score(current_state, word_piece)
+              probability_sum += word_probability
+          probability_sum += language_model.end(current_state) if idx == len(original_text) - 1 else 0
+          probability_sum -= calculate_translation_length(translated_text)
+      return probability_sum
+    
+     
+  def get_swapped_pairs(english_phrases, french_phrases):
+      swapped_results = []
+
+      for idx1 in range(len(french_phrases) - 1):
+          for idx2 in range(idx1, len(french_phrases)):
+              modified_english = english_phrases.copy()
+              modified_english[idx1], modified_english[idx2] = modified_english[idx2], modified_english[idx1]
+              modified_french = french_phrases.copy()
+              modified_french[idx1], modified_french[idx2] = modified_french[idx2], modified_french[idx1]
+              swapped_results.append((modified_english, modified_french))         
+      return swapped_results
+
+  def get_double_phrase_translations(english_list, french_list, translation_dict):
+      paired_translations = []
+      
+      for idx in range(len(french_list) - 1):
+          french_phrase1, french_phrase2 = french_list[idx], french_list[idx + 1]
+
+          if french_phrase1 in translation_dict and french_phrase2 in translation_dict:
+              for translation1 in translation_dict[french_phrase1]:
+                  for translation2 in translation_dict[french_phrase2]:
+                      updated_english = english_list.copy()
+                      updated_english[idx], updated_english[idx + 1] = translation1, translation2
+                      paired_translations.append((updated_english, french_list))
+                      
+      return paired_translations
+
+  def get_merged_pairs(english_phrases, french_phrases, translation_dict):
+      merged_results = []
+      for idx in range(len(french_phrases) - 1):
+          combined_french = french_phrases[idx] + french_phrases[idx + 1]
+          if combined_french in translation_dict:      
+              updated_french = french_phrases.copy()
+              updated_french[idx] = combined_french
+              del updated_french[idx + 1]
+              updated_english = english_phrases.copy()
+              updated_english[idx] = english_phrases[idx] + english_phrases[idx + 1]
+              del updated_english[idx + 1]
+              merged_results.append((updated_english, updated_french))
+              
+      return merged_results
+     
+  def split_pairs(english_phrases, french_phrases, translation_dict):
+      split_results = []
+
+      for idx in range(len(french_phrases)):
+          if len(french_phrases[idx]) > 1:
+              for split_idx in range(len(french_phrases[idx])):
+                  first_segment = french_phrases[idx][:split_idx + 1]
+                  second_segment = french_phrases[idx][split_idx + 1:]
+
+                  if first_segment not in translation_dict or second_segment not in translation_dict:
+                      continue
+
+                  for alt_translation1 in translation_dict[first_segment]:
+                      for alt_translation2 in translation_dict[second_segment]:
+                          
+                          modified_french = french_phrases.copy()
+                          modified_french.insert(idx, first_segment)
+                          modified_french[idx + 1] = second_segment
+
+                          modified_english = english_phrases.copy()
+                          modified_english.insert(idx, alt_translation1)
+                          modified_english[idx + 1] = alt_translation2
+
+                          split_results.append((modified_english, modified_french))
+                          
+      return split_results
+
+
+  def find_optimal_translation(initial_seed, language_model, translation_model): 
+      _, curr_english, curr_french = extract(initial_seed)
+      curr_best_translation = (curr_english, curr_french)
+      
+      for _ in range(200):
+          curr_score = calculate_score(language_model, curr_best_translation[0], curr_best_translation[1])
+          optimal_translation = curr_best_translation
+          max_score = curr_score
+          
+          for possible_translation in potential_translations(curr_english, curr_french, translation_model):
+              translation_score = calculate_score(language_model, possible_translation[0], possible_translation[1])
+              
+              if translation_score > max_score:
+                  optimal_translation = possible_translation
+                  max_score = translation_score
+
+          if max_score == curr_score:
+              return curr_best_translation
+          curr_best_translation = optimal_translation
+          
+      return curr_best_translation
+
+
+
+  def neighborhood(english, french, tm):
+      return get_swapped_pairs(english, french) + get_alternate_translations(english, french, tm) + get_double_phrase_translations(english, french, tm) + split_pairs(english, french, tm) + get_merged_pairs(english, french, tm)
+     
+  def calculate_score(language_model, english_translation, french_translation):
+      return compute_greedy_score(language_model, english_translation, french_translation)
+     
+ 
+
+  def potential_translations(english_translation, french_translation, translation_model):
+      return neighborhood(english_translation, french_translation, translation_model)
+
+  final_translation = find_optimal_translation(winner, lm, tm)[0]
+  translated_words = [word[0] for word in final_translation]
+  print(' '.join(translated_words))
+
