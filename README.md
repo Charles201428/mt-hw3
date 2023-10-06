@@ -1,6 +1,7 @@
 There are two python programs here (-h for usage):
 
-- `decode` translates input sentences from French to English.
+- `decode` translates input sentences from French to English based on BEAM search.
+- `decode-ext` implements greedy search.
 - `grade` computes the model score of a translated sentence.
 
 These commands work in a pipeline. For example:
